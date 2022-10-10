@@ -12,3 +12,5 @@
 # Added by cargo
 
 /target
+
+config.json
