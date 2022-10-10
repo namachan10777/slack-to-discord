@@ -90,11 +90,11 @@ impl<'de> Visitor<'de> for TimeStampVisitor {
         formatter.write_str("expect <secs>.<msecs>")
     }
 
-    fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Ok(parse_timestamp(&v).map_err(|e| E::custom(e))?)
+        parse_timestamp(v).map_err(|e| E::custom(e))
     }
 }
 

@@ -35,7 +35,7 @@ pub enum DbError {
     InvalidContentType,
 }
 
-#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct FileRow {
     pub url: String,
     pub inner: Vec<u8>,
@@ -90,13 +90,13 @@ impl Db {
             Ok(FileRow {
                 url: url.to_owned(),
                 inner: bytes,
-                mime: mime,
+                mime,
             })
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct File {
     id: u64,
     url: String,
@@ -154,15 +154,15 @@ pub async fn provision_channels(
         token,
         &config
             .0
-            .iter()
-            .map(|(_, category)| category.as_str())
+            .values()
+            .map(|category| category.as_str())
             .collect(),
     )
     .await?;
 
     let categories_reverse = categories
         .iter()
-        .map(|(x, y)| (y, x).clone())
+        .map(|(x, y)| (y, x))
         .collect::<HashMap<_, _>>();
 
     let mut channels_deployed = discord::get_channels(guild, token)
@@ -223,8 +223,8 @@ pub fn get_channels_stream<R: std::io::Read + std::io::Seek>(
         let entry = zip
             .by_name("channels.json")
             .with_context(|| "read channels.json")?;
-        let channels = serde_json::from_reader(entry).with_context(|| "parse channels.json")?;
-        channels
+
+        serde_json::from_reader(entry).with_context(|| "parse channels.json")?
     };
 
     let mut channels = channels
@@ -244,7 +244,7 @@ pub fn get_channels_stream<R: std::io::Read + std::io::Seek>(
             .by_index(index)
             .with_context(|| format!("get zip entry at {}", index))?;
         let entry_name = String::from_utf8(entry.name_raw().to_owned())
-            .with_context(|| format!("read zip entry name as utf8"))?;
+            .with_context(|| "read zip entry name as utf8".to_string())?;
         if let &[channel_name, file_name] = &entry_name.split('/').collect::<Vec<_>>()[..] {
             if file_name.is_empty() {
                 debug!("skip dir {}", entry_name);
@@ -285,7 +285,7 @@ struct PostRecord {
 }
 
 fn replace_slack_id_to_real_name(dict: &HashMap<String, String>, src: &str) -> String {
-    dict.into_iter()
+    dict.iter()
         .fold(src.to_owned(), |src, (from, to)| src.replace(from, to))
 }
 
@@ -302,7 +302,7 @@ pub async fn post_channel(
     let discord_channel_id = &discord_channel.id;
 
     let user_id_to_real_name = users
-        .into_iter()
+        .iter()
         .map(|(_, user)| (user.id.clone(), user.readable_name().to_owned()))
         .collect::<HashMap<_, _>>();
 
@@ -330,7 +330,7 @@ pub async fn post_channel(
                     let message = discord::MessagePost {
                         content: replace_slack_id_to_real_name(&user_id_to_real_name, &text),
                     };
-                    let files = files.into_iter().flatten().collect::<Vec<_>>();
+                    let files = files.iter().flatten().collect::<Vec<_>>();
                     let files = futures::stream::iter(files)
                         .filter_map(|file| async move {
                             match file {
@@ -339,7 +339,7 @@ pub async fn post_channel(
                                     title,
                                     url_private_download,
                                 } => {
-                                    let file_row = db.fetch_file(&url_private_download).await;
+                                    let file_row = db.fetch_file(url_private_download).await;
                                     Some(file_row.map(|file_row| {
                                         let file = discord::FilePost {
                                             mime: file_row.mime.clone(),

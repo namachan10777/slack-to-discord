@@ -1,13 +1,11 @@
 use anyhow::Context;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use slack_to_discord::slack::File;
-use slack_to_discord::{slack, ChannelConfig, Db};
+use slack_to_discord::{slack, ChannelConfig};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::{fs, io};
 use tracing::info;
-use zip::ZipArchive;
 
 #[derive(clap::Parser, Debug)]
 struct Opts {

@@ -137,7 +137,7 @@ async fn get_method<T: DeserializeOwned>(token: &BotToken, url: &str) -> Result<
         .await
         .map_err(Error::Request)?;
     trace!("response: {}", response);
-    Ok(serde_json::from_str(&response).map_err(Error::Schema)?)
+    serde_json::from_str(&response).map_err(Error::Schema)
 }
 
 async fn post_method_json<R: DeserializeOwned, P: Serialize>(
@@ -156,7 +156,7 @@ async fn post_method_json<R: DeserializeOwned, P: Serialize>(
         .await
         .map_err(Error::Request)?;
     trace!("response: {}", response);
-    Ok(serde_json::from_str(&response).map_err(Error::Schema)?)
+    serde_json::from_str(&response).map_err(Error::Schema)
 }
 
 pub async fn get_channels(guild: &GuildId, token: &BotToken) -> Result<Vec<ChannelGet>, Error> {
