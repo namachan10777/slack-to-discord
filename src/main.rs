@@ -1,10 +1,13 @@
 use anyhow::Context;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use slack_to_discord::ChannelConfig;
+use slack_to_discord::slack::File;
+use slack_to_discord::{slack, ChannelConfig, Db};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::{fs, io};
 use tracing::info;
+use zip::ZipArchive;
 
 #[derive(clap::Parser, Debug)]
 struct Opts {
@@ -38,6 +41,15 @@ async fn main() -> Result<(), anyhow::Error> {
         .with_context(|| "read channels.json")?;
     let channels = serde_json::from_reader(channels_json).with_context(|| "parse channels.json")?;
 
+    let users = archive
+        .by_name("users.json")
+        .with_context(|| "read users.json")?;
+    let users = serde_json::from_reader::<_, Vec<slack::User>>(users)
+        .with_context(|| "parse users.json")?
+        .into_iter()
+        .map(|user| (user.id.clone(), user))
+        .collect::<HashMap<_, _>>();
+
     let guild = slack_to_discord::discord::GuildId::from_env("GUILD_ID")?;
     let token = slack_to_discord::discord::BotToken::from_env("BOT_TOKEN")?;
 
@@ -50,13 +62,17 @@ async fn main() -> Result<(), anyhow::Error> {
         slack_to_discord::provision_channels(&guild, &token, channels, &config.channel).await?;
     let slack_messages =
         slack_to_discord::get_channels_stream(&mut archive).with_context(|| "load messages")?;
+
     for channel in slack_messages {
+        if !discord_channels.contains_key(&channel.name) {
+            continue;
+        }
         info!(
             "channel {} has {} messages",
             channel.name,
             channel.messages.len()
         );
-        slack_to_discord::post_channel(&db, &token, &discord_channels, &channel).await?;
+        slack_to_discord::post_channel(&db, &token, &discord_channels, &channel, &users).await?;
     }
     Ok(())
 }

@@ -1,7 +1,11 @@
-use reqwest::Client;
+use std::collections::HashMap;
+
+use reqwest::{multipart, Client};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::json;
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use sqlx::{Decode, Encode};
+use tracing::{info, trace};
 
 const DISCORD_ENDPOINT_COMMON: &str = "https://discord.com/api/v10";
 
@@ -10,6 +14,12 @@ pub struct GuildId(String);
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash, Clone)]
 pub struct ChannelId(String);
+
+impl From<String> for ChannelId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
 
 impl<'r, DB: sqlx::Database> sqlx::Decode<'r, DB> for ChannelId
 where
@@ -95,6 +105,7 @@ pub enum ChannelType {
     GuildText = 0,
     GuildVoice = 2,
     GuildCategory = 4,
+    PublicThread = 11,
 }
 
 #[derive(Serialize)]
@@ -107,10 +118,12 @@ pub struct ChannelPost {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("request {0}")]
+    #[error("request :: {0}")]
     Request(reqwest::Error),
-    #[error("schema {0}")]
-    Schema(reqwest::Error),
+    #[error("schema :: {0}")]
+    Schema(serde_json::Error),
+    #[error("invalid mime :: {0}")]
+    InvalidMimeType(reqwest::Error),
 }
 
 async fn get_method<T: DeserializeOwned>(token: &BotToken, url: &str) -> Result<T, Error> {
@@ -120,10 +133,11 @@ async fn get_method<T: DeserializeOwned>(token: &BotToken, url: &str) -> Result<
         .send()
         .await
         .map_err(Error::Request)?
-        .json::<T>()
+        .text()
         .await
-        .map_err(Error::Schema)?;
-    Ok(response)
+        .map_err(Error::Request)?;
+    trace!("response: {}", response);
+    Ok(serde_json::from_str(&response).map_err(Error::Schema)?)
 }
 
 async fn post_method_json<R: DeserializeOwned, P: Serialize>(
@@ -138,10 +152,11 @@ async fn post_method_json<R: DeserializeOwned, P: Serialize>(
         .send()
         .await
         .map_err(Error::Request)?
-        .json::<R>()
+        .text()
         .await
-        .map_err(Error::Schema)?;
-    Ok(response)
+        .map_err(Error::Request)?;
+    trace!("response: {}", response);
+    Ok(serde_json::from_str(&response).map_err(Error::Schema)?)
 }
 
 pub async fn get_channels(guild: &GuildId, token: &BotToken) -> Result<Vec<ChannelGet>, Error> {
@@ -171,6 +186,13 @@ pub async fn post_channel(
         channel,
     )
     .await
+}
+
+#[derive(Debug, Clone)]
+pub struct FilePost {
+    pub mime: String,
+    pub title: String,
+    pub body: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -224,14 +246,89 @@ pub async fn post_message(
     token: &BotToken,
     channel: &ChannelId,
     message: &MessagePost,
+    attached_files: HashMap<String, FilePost>,
 ) -> Result<MessageGet, Error> {
+    if attached_files.is_empty() {
+        post_method_json(
+            token,
+            &format!(
+                "{}/channels/{}/messages",
+                DISCORD_ENDPOINT_COMMON, channel.0
+            ),
+            message,
+        )
+        .await
+    } else {
+        let attachments = attached_files
+            .iter()
+            .enumerate()
+            .map(|(index, (filename, file))| {
+                json!({
+                    "id": index,
+                    "filename": filename,
+                    "description": file.title.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let parts = attached_files
+            .into_iter()
+            .map(|(filename, file)| {
+                multipart::Part::bytes(file.body)
+                    .file_name(filename)
+                    .mime_str(&file.mime)
+                    .map_err(Error::InvalidMimeType)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let form = parts
+            .into_iter()
+            .enumerate()
+            .fold(multipart::Form::new(), |form, (index, part)| {
+                form.part(format!("files[{}]", index), part)
+            });
+        let payload_json = json!({
+            "content": message.content,
+            "attachments": attachments,
+        });
+        let form = form.part(
+            "payload_json",
+            multipart::Part::text(serde_json::to_string(&payload_json).unwrap())
+                .mime_str("application/json")
+                .unwrap(),
+        );
+        info!("post files");
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/channels/{}/messages",
+                DISCORD_ENDPOINT_COMMON, channel.0
+            ))
+            .multipart(form)
+            .header("Authorization", format!("Bot {}", token.0))
+            .send()
+            .await
+            .map_err(Error::Request)?
+            .text()
+            .await
+            .map_err(Error::Request)?;
+        trace!("response: {}", response);
+        serde_json::from_str(&response).map_err(Error::Schema)
+    }
+}
+
+pub async fn start_thread(
+    token: &BotToken,
+    channel: &ChannelId,
+    message_id: &MessageId,
+    name: &str,
+) -> Result<ChannelGet, Error> {
     post_method_json(
         token,
         &format!(
-            "{}/chanels/{}/messages/",
-            DISCORD_ENDPOINT_COMMON, channel.0
+            "{}/channels/{}/messages/{}/threads",
+            DISCORD_ENDPOINT_COMMON, channel.0, message_id.0
         ),
-        message,
+        json!({
+            "name": name,
+        }),
     )
     .await
 }

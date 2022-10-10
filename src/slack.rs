@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{de::Visitor, Deserialize, Deserializer};
 use sqlx::{Database, Decode, Encode};
@@ -13,6 +15,12 @@ pub struct TimeStamp(DateTime<Utc>);
 impl TimeStamp {
     pub fn date(&self) -> &DateTime<Utc> {
         &self.0
+    }
+}
+
+impl Display for TimeStamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{}", self.0))
     }
 }
 
@@ -90,11 +98,35 @@ impl<'de> Visitor<'de> for TimeStampVisitor {
     }
 }
 
-fn deserialize_timestamp<'de, D>(deserializer: D) -> Result<TimeStamp, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserializer.deserialize_str(TimeStampVisitor)
+impl<'de> Deserialize<'de> for TimeStamp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_str(TimeStampVisitor)
+    }
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum MessageSubType {
+    #[serde(rename = "channel_join")]
+    Join,
+    #[serde(rename = "channel_purpose")]
+    Purpose,
+    #[serde(rename = "thread_broadcast")]
+    ThreadBroadcast,
+    #[serde(rename = "tombstone")]
+    Tombstone,
+    #[serde(rename = "channel_topic")]
+    Topic,
+    #[serde(rename = "reminder_add")]
+    ReminderAdd,
+    #[serde(rename = "channel_name")]
+    ChannelName,
+    #[serde(rename = "channel_archive")]
+    Archive,
+    #[serde(rename = "channel_unarchive")]
+    Unarchive,
 }
 
 #[derive(Deserialize, Debug)]
@@ -104,9 +136,11 @@ pub enum Message {
     Message {
         text: String,
         files: Option<Vec<File>>,
-        #[serde(deserialize_with = "deserialize_timestamp")]
+        user: String,
+        subtype: Option<MessageSubType>,
         ts: TimeStamp,
         reply_count: Option<u64>,
+        thread_ts: Option<TimeStamp>,
     },
 }
 
@@ -131,4 +165,21 @@ pub enum File {
 pub struct Channel {
     pub name: String,
     pub id: String,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct User {
+    pub id: String,
+    pub real_name: Option<String>,
+    pub name: String,
+}
+
+impl User {
+    pub fn readable_name(&self) -> &str {
+        if let Some(real_name) = &self.real_name {
+            real_name
+        } else {
+            &self.name
+        }
+    }
 }

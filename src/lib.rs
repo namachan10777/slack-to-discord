@@ -1,7 +1,15 @@
+#![feature(let_chains)]
 use anyhow::Context;
-use discord::{ChannelGet, ChannelId, MessageId, MessagePost};
+use discord::ChannelGet;
+use futures::StreamExt;
 use slack::Message;
-use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+use std::{
+    borrow::Borrow,
+    collections::{HashMap, HashSet},
+    ops::Deref,
+};
+use tokio::time::sleep;
 use tracing::{debug, info, warn};
 use zip::ZipArchive;
 
@@ -9,7 +17,7 @@ pub mod discord;
 pub mod slack;
 
 pub struct Db {
-    pool: sqlx::Pool<sqlx::Sqlite>,
+    pub pool: sqlx::Pool<sqlx::Sqlite>,
     http_client: reqwest::Client,
 }
 
@@ -21,30 +29,35 @@ pub enum DbError {
     InsertSql(sqlx::Error),
     #[error("fetch from url {0}")]
     FetchFromUrl(reqwest::Error),
+    #[error("no content-type")]
+    NoCntentType,
+    #[error("invalid content type")]
+    InvalidContentType,
 }
 
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
-struct FileRow {
-    url: String,
-    inner: Vec<u8>,
+pub struct FileRow {
+    pub url: String,
+    pub inner: Vec<u8>,
+    pub mime: String,
 }
 
 impl Db {
     pub async fn new(url: &str) -> Result<Self, sqlx::Error> {
+        info!("connect db: {}", url);
         let pool = sqlx::sqlite::SqlitePool::connect(url).await?;
         let http_client = reqwest::Client::new();
         Ok(Self { pool, http_client })
     }
 
-    pub async fn fetch_file(&self, url: &str) -> Result<Vec<u8>, DbError> {
-        let row = sqlx::query_as::<_, FileRow>("select * from files where url = $1")
-            .bind(url)
+    pub async fn fetch_file(&self, url: &str) -> Result<FileRow, DbError> {
+        let row = sqlx::query_as!(FileRow, "select * from files where url = ?", url)
             .fetch_optional(&self.pool)
             .await
             .map_err(DbError::GetSql)?;
         if let Some(row) = row {
             debug!("{} found in db", url);
-            Ok(row.inner)
+            Ok(row)
         } else {
             debug!("download {}", url);
             let response = self
@@ -52,17 +65,33 @@ impl Db {
                 .get(url)
                 .send()
                 .await
-                .map_err(DbError::FetchFromUrl)?
+                .map_err(DbError::FetchFromUrl)?;
+            let mime = response
+                .headers()
+                .get("content-type")
+                .ok_or(DbError::NoCntentType)?
+                .to_str()
+                .map_err(|_| DbError::InvalidContentType)?
+                .to_owned();
+            let bytes = response
                 .bytes()
                 .await
-                .map_err(DbError::FetchFromUrl)?;
-            sqlx::query("insert into files (url, inner) values ($1, $2)")
-                .bind(url)
-                .bind(response.as_ref())
-                .execute(&self.pool)
-                .await
-                .map_err(DbError::InsertSql)?;
-            Ok(response.as_ref().to_vec())
+                .map_err(DbError::FetchFromUrl)?
+                .to_vec();
+            sqlx::query!(
+                "insert into files (url, inner, mime) values (?, ?, ?)",
+                url,
+                bytes,
+                mime
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(DbError::InsertSql)?;
+            Ok(FileRow {
+                url: url.to_owned(),
+                inner: bytes,
+                mime: mime,
+            })
         }
     }
 }
@@ -78,34 +107,37 @@ pub struct File {
 #[serde(transparent)]
 pub struct ChannelConfig(HashMap<String, String>);
 
-async fn provision_channel_categories<S: AsRef<str>>(
+async fn provision_channel_categories(
     guild: &discord::GuildId,
     token: &discord::BotToken,
-    categories: &HashSet<S>,
+    categories: &HashSet<&str>,
 ) -> Result<HashMap<String, discord::ChannelId>, anyhow::Error> {
     let mut deployed_categories = discord::get_channels(guild, token)
         .await?
         .into_iter()
-        .filter(|channel| channel.channel_type == discord::ChannelType::GuildCategory)
+        .filter(|channel| {
+            channel.channel_type == discord::ChannelType::GuildCategory
+                && categories.contains(&channel.name.borrow())
+        })
         .map(|channel| (channel.name, channel.id))
         .collect::<HashMap<_, _>>();
 
     for category in categories {
-        if !deployed_categories.contains_key(category.as_ref()) {
+        if !deployed_categories.contains_key(*category) {
             let channel = discord::post_channel(
                 guild,
                 token,
                 &discord::ChannelPost {
-                    name: category.as_ref().to_owned(),
+                    name: category.deref().to_owned(),
                     channel_type: discord::ChannelType::GuildCategory,
                     parent_id: None,
                 },
             )
             .await
-            .with_context(|| format!("create category {}", category.as_ref()))?;
-            deployed_categories.insert(category.as_ref().to_owned(), channel.id);
+            .with_context(|| format!("create category {}", category))?;
+            deployed_categories.insert(category.deref().to_owned(), channel.id);
         }
-        info!("provisioned category {}", category.as_ref());
+        info!("provisioned category {}", category);
     }
 
     Ok(deployed_categories)
@@ -120,7 +152,11 @@ pub async fn provision_channels(
     let categories = provision_channel_categories(
         guild,
         token,
-        &config.0.iter().map(|(_, category)| category).collect(),
+        &config
+            .0
+            .iter()
+            .map(|(_, category)| category.as_str())
+            .collect(),
     )
     .await?;
 
@@ -133,19 +169,22 @@ pub async fn provision_channels(
         .await
         .with_context(|| "get discord channels")?
         .into_iter()
-        .filter(|channel| channel.channel_type == discord::ChannelType::GuildText)
-        .map(|channel| (channel.name.clone(), channel))
+        .filter(|channel| {
+            channel.channel_type == discord::ChannelType::GuildText
+                && channel
+                    .parent_id
+                    .as_ref()
+                    .map(|id| categories_reverse.contains_key(&id))
+                    .unwrap_or(false)
+        })
+        .map(|channel| (channel.name.to_owned(), channel))
         .collect::<HashMap<_, _>>();
 
+    debug!("deployed :{:#?} ", channels_deployed);
+
     for channel in channels {
-        if let Some(deployed_channel) = channels_deployed.get(&channel.name) {
-            if let Some(parent_id) = &deployed_channel.parent_id {
-                if let Some(parent_channel_name) = categories_reverse.get(&parent_id) {
-                    if *parent_channel_name == &channel.name {
-                        continue;
-                    }
-                }
-            }
+        if let Some(_deployed_channel) = channels_deployed.get(&channel.name) {
+            continue;
         }
 
         if let Some(category_name) = config.0.get(&channel.name) {
@@ -236,13 +275,18 @@ pub fn get_channels_stream<R: std::io::Read + std::io::Seek>(
     Ok(sorted_channels)
 }
 
-#[derive(Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Clone, PartialEq, Eq, sqlx::FromRow, Debug)]
 struct PostRecord {
-    id: MessageId,
+    id: String,
     slack_channel_id: String,
-    discord_channel_id: ChannelId,
-    slack_ts: slack::TimeStamp,
-    discord_thread_id: ChannelId,
+    discord_channel_id: String,
+    slack_ts: String,
+    discord_thread_id: Option<String>,
+}
+
+fn replace_slack_id_to_real_name(dict: &HashMap<String, String>, src: &str) -> String {
+    dict.into_iter()
+        .fold(src.to_owned(), |src, (from, to)| src.replace(from, to))
 }
 
 pub async fn post_channel(
@@ -250,51 +294,130 @@ pub async fn post_channel(
     token: &discord::BotToken,
     discord_channels: &HashMap<String, ChannelGet>,
     channel: &SlackChannel,
+    users: &HashMap<String, slack::User>,
 ) -> Result<(), anyhow::Error> {
     let discord_channel = discord_channels
         .get(&channel.name)
         .with_context(|| format!("get discord_channel_id of {}", &channel.name))?;
     let discord_channel_id = &discord_channel.id;
+
+    let user_id_to_real_name = users
+        .into_iter()
+        .map(|(_, user)| (user.id.clone(), user.readable_name().to_owned()))
+        .collect::<HashMap<_, _>>();
+
     for message in &channel.messages {
         match message {
             slack::Message::Message {
                 text,
                 files,
                 ts,
+                reply_count,
+                user,
+                thread_ts,
                 ..
             } => {
-                let message_on_db = sqlx::query_as::<_, PostRecord>(
-                    "select * from posts where slack_ts == $1 and slack_channel_id == $2",
+                let message_on_db: Option<PostRecord> = sqlx::query_as!(
+                    PostRecord,
+                    "select * from posts where slack_ts = ? and slack_channel_id = ?",
+                    ts,
+                    channel.id
                 )
-                .bind(ts)
-                .bind(&channel.id)
                 .fetch_optional(&db.pool)
-                .await
-                .with_context(|| format!("read message on {} at {}", channel.name, ts.date()))?;
+                .await?;
+                if message_on_db.is_none() {
+                    let text = format!("**{}** {}\n{}\n", user, ts, text);
+                    let message = discord::MessagePost {
+                        content: replace_slack_id_to_real_name(&user_id_to_real_name, &text),
+                    };
+                    let files = files.into_iter().flatten().collect::<Vec<_>>();
+                    let files = futures::stream::iter(files)
+                        .filter_map(|file| async move {
+                            match file {
+                                slack::File::Hosted {
+                                    name,
+                                    title,
+                                    url_private_download,
+                                } => {
+                                    let file_row = db.fetch_file(&url_private_download).await;
+                                    Some(file_row.map(|file_row| {
+                                        let file = discord::FilePost {
+                                            mime: file_row.mime.clone(),
+                                            title: title.clone(),
+                                            body: file_row.inner,
+                                        };
+                                        (name.clone(), file)
+                                    }))
+                                }
+                                _ => None,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .await
+                        .into_iter()
+                        .collect::<Result<HashMap<_, _>, _>>()?;
+                    if let Some(thread_ts) = thread_ts && reply_count.is_none() {
+                            debug!("reply to {}", thread_ts);
+                            let thread = sqlx::query_as!(
+                                PostRecord,
+                                "select * from posts where slack_ts = ? and slack_channel_id = ?",
+                                thread_ts,
+                                channel.id
+                            )
+                            .fetch_one(&db.pool)
+                            .await?;
+                            let discord_thread_id =
+                                thread.discord_thread_id.with_context(|| {
+                                    format!(
+                                        "thread {} on {} not found",
+                                        thread.slack_ts, channel.name
+                                    )
+                                })?;
+                            let msg = discord::post_message(token, &discord_thread_id.into(), &message, files)
+                                .await?;
 
-                if message_on_db.is_some() {
-                    continue;
-                }
+                            sqlx::query!(
+                                "insert into posts values (?, ?, ?, ?, ?);",
+                                msg.id,
+                                channel.id,
+                                discord_channel_id,
+                                ts,
+                                None::<String>,
+                            )
+                            .execute(&db.pool)
+                            .await?;
+                        } else {
+                            let msg =
+                                discord::post_message(token, discord_channel_id, &message, files).await?;
+                            let thread_id = if let Some(count) = reply_count && *count > 0 {
+                                    debug!("reply_count: {:?}", count);
+                                    Some(
+                                        discord::start_thread(
+                                            token,
+                                            discord_channel_id,
+                                            &msg.id,
+                                            "slack thread",
+                                        )
+                                        .await?
+                                        .id,
+                                    )
+                                } else {
+                                    None
+                                };
 
-                if let Some(_files) = files {
-                    unimplemented!();
-                } else {
-                    let discord_message = discord::post_message(
-                        token,
-                        &discord_channel_id,
-                        &MessagePost {
-                            content: text.clone(),
-                        },
-                    )
-                    .await?;
-                    sqlx::query(
-                        "insert into posts (id, slack_channel_id, discord_channel_id, slack_ts, discord_thread_id) values ($1, $2, $3, $4, null)"
-                    )
-                    .bind(discord_message.id)
-                    .bind(&channel.id)
-                    .bind(discord_message.channel_id)
-                    .bind(ts)
-                    .execute(&db.pool).await?;
+
+                            sqlx::query!(
+                                "insert into posts values (?, ?, ?, ?, ?);",
+                                msg.id,
+                                channel.id,
+                                discord_channel_id,
+                                ts,
+                                thread_id
+                            )
+                            .execute(&db.pool)
+                            .await?;
+                        }
+                    sleep(Duration::from_millis(1000)).await;
                 }
             }
         }
