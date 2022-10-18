@@ -1,6 +1,7 @@
 use std::fmt::Display;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono_tz::Tz;
 use serde::{de::Visitor, Deserialize, Deserializer};
 use sqlx::{Database, Decode, Encode};
 pub type MessagePerDay = Vec<Message>;
@@ -15,6 +16,10 @@ pub struct TimeStamp(DateTime<Utc>);
 impl TimeStamp {
     pub fn date(&self) -> &DateTime<Utc> {
         &self.0
+    }
+
+    pub fn jtc_date(&self) -> DateTime<Tz> {
+        self.0.with_timezone(&chrono_tz::Asia::Tokyo)
     }
 }
 

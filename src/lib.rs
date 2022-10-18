@@ -1,5 +1,6 @@
 #![feature(let_chains)]
 use anyhow::Context;
+use chrono::{FixedOffset, TimeZone};
 use discord::ChannelGet;
 use futures::StreamExt;
 use slack::Message;
@@ -10,6 +11,7 @@ use std::{
     ops::Deref,
 };
 use tokio::time::sleep;
+
 use tracing::{debug, info, warn};
 use zip::ZipArchive;
 
@@ -79,7 +81,7 @@ impl Db {
                 .map_err(DbError::FetchFromUrl)?
                 .to_vec();
             sqlx::query!(
-                "insert into files (url, inner, mime) values (?, ?, ?)",
+                r#"insert into files (url, inner, mime) values (?, ?, ?)"#,
                 url,
                 bytes,
                 mime
@@ -326,7 +328,7 @@ pub async fn post_channel(
                 .fetch_optional(&db.pool)
                 .await?;
                 if message_on_db.is_none() {
-                    let text = format!("**{}** {}\n{}\n", user, ts, text);
+                    let text = format!("**{}** {}\n{}\n", user, ts.jtc_date().to_rfc2822(), text);
                     let message = discord::MessagePost {
                         content: replace_slack_id_to_real_name(&user_id_to_real_name, &text),
                     };
