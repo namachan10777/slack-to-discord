@@ -10,7 +10,7 @@ pub fn hello() -> String {
     "Hello World!".into()
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub struct TimeStamp(DateTime<Utc>);
 
 impl TimeStamp {

@@ -1,6 +1,5 @@
 #![feature(let_chains)]
 use anyhow::Context;
-use chrono::{FixedOffset, TimeZone};
 use discord::ChannelGet;
 use futures::StreamExt;
 use slack::Message;
@@ -14,6 +13,8 @@ use tokio::time::sleep;
 
 use tracing::{debug, info, warn};
 use zip::ZipArchive;
+
+use crate::discord::archive_channel;
 
 pub mod discord;
 pub mod slack;
@@ -256,7 +257,7 @@ pub fn get_channels_stream<R: std::io::Read + std::io::Seek>(
                 .with_context(|| format!("parse {}", entry_name))?;
             channels
                 .get_mut(channel_name)
-                .with_context(|| format!("{} not found in channels.json", entry_name))?
+                .with_context(|| format!("{} not found in channels.json", channel_name))?
                 .messages
                 .append(&mut messages);
         } else {
@@ -308,6 +309,8 @@ pub async fn post_channel(
         .map(|(_, user)| (user.id.clone(), user.readable_name().to_owned()))
         .collect::<HashMap<_, _>>();
 
+    let mut reply_counts = HashMap::new();
+
     for message in &channel.messages {
         match message {
             slack::Message::Message {
@@ -319,6 +322,9 @@ pub async fn post_channel(
                 thread_ts,
                 ..
             } => {
+                if let Some(reply_count) = reply_count {
+                    reply_counts.insert(ts, *reply_count);
+                }
                 let message_on_db: Option<PostRecord> = sqlx::query_as!(
                     PostRecord,
                     "select * from posts where slack_ts = ? and slack_channel_id = ?",
@@ -341,17 +347,22 @@ pub async fn post_channel(
                                     name,
                                     title,
                                     url_private_download,
-                                } => {
-                                    let file_row = db.fetch_file(url_private_download).await;
-                                    Some(file_row.map(|file_row| {
-                                        let file = discord::FilePost {
-                                            mime: file_row.mime.clone(),
-                                            title: title.clone(),
-                                            body: file_row.inner,
-                                        };
-                                        (name.clone(), file)
-                                    }))
-                                }
+                                } => match db.fetch_file(url_private_download).await {
+                                    Ok(file_raw) => {
+                                        info!("file {} size {} MiB", url_private_download, file_raw.inner.len() as f64 / 1024.0 / 1024.0);
+                                        if file_raw.inner.len() > 8 * 1024 * 1024 {
+                                            None
+                                        } else {
+                                            let file = discord::FilePost {
+                                                mime: file_raw.mime.clone(),
+                                                title: title.clone(),
+                                                body: file_raw.inner,
+                                            };
+                                            Some(Ok((name.clone(), file)))
+                                        }
+                                    }
+                                    Err(e) => Some(Err(e)),
+                                },
                                 _ => None,
                             }
                         })
@@ -376,8 +387,8 @@ pub async fn post_channel(
                                         "thread {} on {} not found",
                                         thread.slack_ts, channel.name
                                     )
-                                })?;
-                            let msg = discord::post_message(token, &discord_thread_id.into(), &message, files)
+                                })?.into();
+                            let msg = discord::post_message(token, &discord_thread_id, &message, files)
                                 .await?;
 
                             sqlx::query!(
@@ -390,6 +401,15 @@ pub async fn post_channel(
                             )
                             .execute(&db.pool)
                             .await?;
+
+                            if let Some(reply_count) = reply_counts.get(thread_ts) {
+                                let thread = discord::get_channel(token, &discord_thread_id).await?;
+                                if thread.message_count == Some(*reply_count) {
+                                    info!("thread {:?} is over", discord_thread_id);
+                                    archive_channel(token, &discord_thread_id).await?;
+                                }
+                            }
+
                         } else {
                             let msg =
                                 discord::post_message(token, discord_channel_id, &message, files).await?;
@@ -423,12 +443,12 @@ pub async fn post_channel(
                             .await?;
                         }
                     sleep(Duration::from_millis(1000)).await;
-                } else {
-                    if let Some(message_on_db) = message_on_db {
-                        if let Some(thread_id) = message_on_db.discord_thread_id {
-                            let thread = discord::get_channel(token, thread_id.into()).await?;
-                            info!("{:?}", thread);
-                        }
+                } else if let Some(thread_id) = message_on_db.and_then(|msg| msg.discord_thread_id)
+                {
+                    let thread = discord::get_channel(token, &thread_id.clone().into()).await?;
+                    if &thread.message_count == reply_count {
+                        info!("thread {} is over", thread_id);
+                        archive_channel(token, &thread_id.into()).await?;
                     }
                 }
             }

@@ -97,6 +97,7 @@ pub struct ChannelGet {
     #[serde(rename = "type")]
     pub channel_type: ChannelType,
     pub parent_id: Option<ChannelId>,
+    pub message_count: Option<u64>,
 }
 
 #[derive(Serialize_repr, Deserialize_repr, Debug, PartialEq, Eq)]
@@ -147,6 +148,25 @@ async fn post_method_json<R: DeserializeOwned, P: Serialize>(
 ) -> Result<R, Error> {
     let response = Client::new()
         .post(url)
+        .header("Authorization", format!("Bot {}", token.as_str()))
+        .json(&payload)
+        .send()
+        .await
+        .map_err(Error::Request)?
+        .text()
+        .await
+        .map_err(Error::Request)?;
+    trace!("response: {}", response);
+    serde_json::from_str(&response).map_err(Error::Schema)
+}
+
+async fn patch_method_json<R: DeserializeOwned, P: Serialize>(
+    token: &BotToken,
+    url: &str,
+    payload: P,
+) -> Result<R, Error> {
+    let response = Client::new()
+        .patch(url)
         .header("Authorization", format!("Bot {}", token.as_str()))
         .json(&payload)
         .send()
@@ -337,6 +357,23 @@ pub async fn start_thread(
         json!({
             "name": name,
         }),
+    )
+    .await
+}
+
+pub async fn get_channel(token: &BotToken, channel: &ChannelId) -> Result<ChannelGet, Error> {
+    get_method(
+        token,
+        &format!("{}/channels/{}", DISCORD_ENDPOINT_COMMON, channel.0),
+    )
+    .await
+}
+
+pub async fn archive_channel(token: &BotToken, channel: &ChannelId) -> Result<ChannelGet, Error> {
+    patch_method_json(
+        token,
+        &format!("{}/channels/{}", DISCORD_ENDPOINT_COMMON, channel.0),
+        &json!({"archived": true}),
     )
     .await
 }
