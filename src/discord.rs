@@ -314,6 +314,14 @@ pub async fn post_message(
     }
 }
 
+pub async fn get_channel(token: &BotToken, channel: &ChannelId) -> Result<ChannelGet, Error> {
+    get_method(
+        token,
+        &format!("{}/channels/{}", DISCORD_ENDPOINT_COMMON, channel.0),
+    )
+    .await
+}
+
 pub async fn start_thread(
     token: &BotToken,
     channel: &ChannelId,

@@ -206,7 +206,7 @@ pub async fn provision_channels(
             .with_context(|| format!("deploy channel {}", channel.name))?;
             channels_deployed.insert(channel.name.clone(), channel);
         } else {
-            warn!("uncofigured channel {}", channel.name);
+            warn!("unconfigured channel {}", channel.name);
         }
     }
     Ok(channels_deployed)
@@ -326,6 +326,7 @@ pub async fn post_channel(
                     channel.id
                 )
                 .fetch_optional(&db.pool)
+                .with_context(|| format!("ts: {}, channel_id: {}", ts, channel.id))
                 .await?;
                 if message_on_db.is_none() {
                     let text = format!("**{}** {}\n{}\n", user, ts.jtc_date().to_rfc2822(), text);
@@ -367,6 +368,7 @@ pub async fn post_channel(
                                 channel.id
                             )
                             .fetch_one(&db.pool)
+                            .with_context(|| format!("ts: {}, channel_id: {}", ts, channel.id))
                             .await?;
                             let discord_thread_id =
                                 thread.discord_thread_id.with_context(|| {
@@ -417,9 +419,17 @@ pub async fn post_channel(
                                 thread_id
                             )
                             .execute(&db.pool)
+                            .with_context(|| format!("msg.id: {}", msg.id))
                             .await?;
                         }
                     sleep(Duration::from_millis(1000)).await;
+                } else {
+                    if let Some(message_on_db) = message_on_db {
+                        if let Some(thread_id) = message_on_db.discord_thread_id {
+                            let thread = discord::get_channel(token, thread_id.into()).await?;
+                            info!("{:?}", thread);
+                        }
+                    }
                 }
             }
         }
